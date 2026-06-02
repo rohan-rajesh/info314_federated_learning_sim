@@ -65,18 +65,24 @@ def run(host, port, ps_host, ps_client_port, ps_coord_port, min_clients, num_rou
     print(f"[coordinator] all clients ready: {selected}")
     for round_id in range(1, num_rounds + 1):
         print(f"[coordinator] starting round {round_id}")
+        # tell server to open the round and push GLOBAL_MODEL to clients first
+        send_msg(ps_sock, COORD_ID, PROTOCOL_MSGS["ROUND_START"],
+                 round_id=round_id, participating_clients=selected)
         for cid in selected:
             send_msg(clients[cid]["sock"], COORD_ID, PROTOCOL_MSGS["START_ROUND"],
                      round_id=round_id, deadline_ms=int(deadline_sec * 1000),
                      local_epochs=5, learning_rate=0.1)
-        # wait for the deadline to pass
+        # wait for the deadline to pass, then close the round at parameter server
         time.sleep(deadline_sec)
         send_msg(ps_sock, COORD_ID, PROTOCOL_MSGS["PROCEED"],
-                 round_id=round_id, participating_clients=selected, skipped_clients=[])
+                 round_id=round_id, participating_clients=selected)
         for msg in ps_msgs:
             if msg["type"] == PROTOCOL_MSGS["ROUND_COMPLETE"]:
+                participated = msg.get("participating_clients", [])
+                skipped = [c for c in selected if c not in participated]
                 print(f"[coordinator] round {round_id} done: "
-                      f"model_v{msg['new_model_version']}, clients={msg['clients_used']}")
+                      f"model_v{msg['new_model_version']}, "
+                      f"participated={participated}, skipped={skipped}")
                 break
     for cid in selected:
         send_msg(clients[cid]["sock"], COORD_ID, PROTOCOL_MSGS["GOODBYE"], reason="training_complete")
