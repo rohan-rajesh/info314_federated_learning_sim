@@ -85,7 +85,13 @@ def run(host, client_port, coord_port):
             with socks_lock:
                 snapped = list(client_socks)
             for sock in snapped:
-                send_global_model(sock)
+                try:
+                    send_global_model(sock)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # client disconnected; drop the dead socket so we don't retry
+                    with socks_lock:
+                        if sock in client_socks:
+                            client_socks.remove(sock)
         elif mtype == PROTOCOL_MSGS["PROCEED"]:
             # close the round: aggregate whatever updates we have & report back
             round_id = msg["round_id"]
