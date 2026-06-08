@@ -1,4 +1,55 @@
-# Federated Learning Protocol Specification
+# Federated Learning Simulator
+
+## Running the Project
+
+**Prerequisites:** Python 3.8+, no external libraries required.
+
+### Quick start (normal demo)
+
+```bash
+bash run.sh
+```
+
+Starts one parameter server, one coordinator, and three clients. Runs 5 rounds with a 5-second deadline. All output is interleaved in the terminal. Press Ctrl-C to stop early.
+
+### Failure-handling demo
+
+```bash
+python3 demo_failure.py
+```
+
+Starts the same three components with a 3-second deadline and `--max-missed-rounds 2`, then kills `client_c` after ~10 seconds. The coordinator detects the missed rounds, marks `client_c` inactive, and training completes with the two remaining clients.
+
+### Running components manually
+
+Start each component in its own terminal in this order: parameter server first, then coordinator, then clients.
+
+```bash
+# 1. Parameter server
+python3 parameter_server.py [--host 127.0.0.1] [--client-port 9100] [--coord-port 9101]
+
+# 2. Coordinator
+python3 coordinator.py [--host 127.0.0.1] [--port 9000] \
+    [--ps-host 127.0.0.1] [--ps-client-port 9100] [--ps-coord-port 9101] \
+    [--min-clients 3] [--num-rounds 10] [--deadline 5.0] [--max-missed-rounds 3]
+
+# 3. One or more clients (run each in its own terminal)
+python3 client.py <client_id> [--dataset-size 500] [--coord 127.0.0.1:9000]
+```
+
+`--min-clients` controls how many clients must register before the first round starts. The coordinator will wait indefinitely until that threshold is met. `--deadline` is the number of seconds the coordinator waits after opening a round before sending `PROCEED` to the parameter server. `--max-missed-rounds` sets how many consecutive rounds a client can miss before being marked inactive and notified with `GOODBYE`.
+
+### Running the standalone model test
+
+```bash
+python3 model.py
+```
+
+Runs the FedAvg algorithm in a single process with no networking, printing per-round loss and final learned weights. Useful for verifying that the gradient descent and aggregation logic are correct in isolation.
+
+---
+
+# Protocol Specification
 
 ## Overview
 
