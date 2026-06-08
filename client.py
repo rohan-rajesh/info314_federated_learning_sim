@@ -6,64 +6,112 @@ import argparse
 from protocol import send_msg, recv_msgs, parse_addr, PROTOCOL_MSGS
 from model import make_dataset, local_train, subtract, mse_loss
 
-def run(client_id, dataset_size, coord_addr):
-    coord_host, coord_port = parse_addr(coord_addr)
 
-    # connect to coordinator 
-    coord_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    for attempt in range(10):
+def _register(client_id, dataset_size, coord_host, coord_port):
+    """Connect to coordinator, send CLIENT_READY, return (sock, msg_generator, ps_addr)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for attempt in range(20):
         try:
-            coord_sock.connect((coord_host, coord_port))
+            sock.connect((coord_host, coord_port))
             break
         except ConnectionRefusedError:
-            if attempt == 9:
+            if attempt == 19:
                 raise
-            time.sleep(0.5)
-
-    send_msg(coord_sock, client_id, PROTOCOL_MSGS["CLIENT_READY"],
+            time.sleep(1.0)
+    send_msg(sock, client_id, PROTOCOL_MSGS["CLIENT_READY"],
              client_id=client_id, dataset_size=dataset_size, protocol_version="1.0")
     print(f"[{client_id}] sent CLIENT_READY ({dataset_size} samples)")
-
-    # single generator for the coord socket
-    coord_msgs = recv_msgs(coord_sock)
-
-    # extract parameter server address from response
-    ps_addr = None
-    for msg in coord_msgs:
+    gen = recv_msgs(sock)
+    for msg in gen:
         if msg["type"] == PROTOCOL_MSGS["READY_ACK"]:
             if msg["status"] != "accepted":
-                print(f"[{client_id}] rejected: {msg.get('reason', '?')}")
-                return
-            ps_addr = msg["parameter_server_addr"]
-            print(f"[{client_id}] accepted, PS at {ps_addr}")
-            break
+                raise RuntimeError(f"rejected by coordinator: {msg.get('reason', '?')}")
+            print(f"[{client_id}] accepted, PS at {msg['parameter_server_addr']}")
+            return sock, gen, msg["parameter_server_addr"]
+    raise RuntimeError("coordinator closed before READY_ACK")
 
+
+def run(client_id, dataset_size, coord_addr):
+    coord_host, coord_port = parse_addr(coord_addr)
+    X, y = make_dataset(client_id, dataset_size)
+
+    coord_sock, coord_gen, ps_addr = _register(client_id, dataset_size, coord_host, coord_port)
     ps_host, ps_port = parse_addr(ps_addr)
     ps_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ps_sock.connect((ps_host, ps_port))
 
-    # generate local training data seeded by client id
-    X, y = make_dataset(client_id, dataset_size)
-    # reader threads feed data to queues 
     coord_q = queue.Queue()
     ps_q = queue.Queue()
-    # hand off the existing generator to the reader thread
-    def read_coord():
-        for msg in coord_msgs:
-            coord_q.put(msg)
 
-    def read_ps():
-        for msg in recv_msgs(ps_sock):
-            ps_q.put(msg)
+    def read_coord(gen):
+        # put None sentinel when the connection closes so the main loop can detect it
+        try:
+            for msg in gen:
+                coord_q.put(msg)
+        except OSError:
+            pass
+        finally:
+            coord_q.put(None)
 
-    threading.Thread(target=read_coord, daemon=True).start()
-    threading.Thread(target=read_ps, daemon=True).start()
+    def read_ps(sock):
+        try:
+            for msg in recv_msgs(sock):
+                ps_q.put(msg)
+        except OSError:
+            pass
+
+    threading.Thread(target=read_coord, args=(coord_gen,), daemon=True).start()
+    threading.Thread(target=read_ps, args=(ps_sock,), daemon=True).start()
+
+    def reconnect(reason):
+        """Re-register with coordinator; reconnect to PS if the address changed.
+        Returns True on success, False after exhausting retries."""
+        nonlocal coord_sock, coord_gen, ps_sock, ps_host, ps_port
+        print(f"[{client_id}] reconnecting (reason={reason!r})...")
+        for attempt in range(20):
+            try:
+                coord_sock, coord_gen, new_ps_addr = _register(
+                    client_id, dataset_size, coord_host, coord_port)
+                new_ps_host, new_ps_port = parse_addr(new_ps_addr)
+                if (new_ps_host, new_ps_port) != (ps_host, ps_port):
+                    ps_sock.close()
+                    ps_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    ps_sock.connect((new_ps_host, new_ps_port))
+                    ps_host, ps_port = new_ps_host, new_ps_port
+                    threading.Thread(target=read_ps, args=(ps_sock,), daemon=True).start()
+                threading.Thread(target=read_coord, args=(coord_gen,), daemon=True).start()
+                return True
+            except Exception as e:
+                print(f"[{client_id}] reconnect attempt {attempt + 1} failed: {e}")
+                if attempt == 19:
+                    return False
+                time.sleep(2.0)
+        return False
 
     while True:
         msg = coord_q.get()
+
+        if msg is None:
+            # coordinator connection dropped unexpectedly
+            print(f"[{client_id}] coordinator connection lost")
+            if not reconnect("connection_lost"):
+                print(f"[{client_id}] giving up after failed reconnects")
+                break
+            continue
+
         if msg["type"] == PROTOCOL_MSGS["GOODBYE"]:
-            print(f"[{client_id}] training complete")
-            break
+            reason = msg.get("reason", "")
+            if reason == "training_complete":
+                print(f"[{client_id}] training complete")
+                break
+            # coordinator marked this client inactive; pause then re-register
+            print(f"[{client_id}] got GOODBYE (reason={reason!r}), will re-register...")
+            time.sleep(1.0)
+            if not reconnect(reason):
+                print(f"[{client_id}] giving up after failed re-registration")
+                break
+            continue
+
         if msg["type"] != PROTOCOL_MSGS["START_ROUND"]:
             continue
 
@@ -74,18 +122,16 @@ def run(client_id, dataset_size, coord_addr):
 
         # wait for the matching global model for this round
         while True:
-            msg = ps_q.get()
-            if msg["type"] == PROTOCOL_MSGS["GLOBAL_MODEL"] and msg["round_id"] == round_id:
-                weights = msg["weights"]
-                print(f"[{client_id}] received model v{msg['model_version']}")
+            ps_msg = ps_q.get()
+            if ps_msg["type"] == PROTOCOL_MSGS["GLOBAL_MODEL"] and ps_msg["round_id"] == round_id:
+                weights = ps_msg["weights"]
+                print(f"[{client_id}] received model v{ps_msg['model_version']}")
                 break
 
-        # train locally and compute the weight delta against the global model
         trained = local_train(weights, X, y, epochs=epochs, lr=lr)
         delta = subtract(trained, weights)
         loss = mse_loss(trained, X, y)
 
-        # send weight delta back to parameter server
         send_msg(ps_sock, client_id, PROTOCOL_MSGS["WEIGHT_UPDATE"],
                  round_id=round_id, client_id=client_id,
                  weight_delta=delta, dataset_size=dataset_size, local_loss=loss)
